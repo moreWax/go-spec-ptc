@@ -28,6 +28,7 @@ type entry struct {
 
 	// The fields below are actor-owned.
 	state            entryState
+	order            uint64
 	refs             int
 	claims           int
 	successfulClaims int
@@ -64,8 +65,10 @@ type claimMessage struct {
 	reply  chan<- *entry
 }
 type claimOutcomeMessage struct {
-	entry *entry
-	hit   bool
+	entry    *entry
+	hit      bool
+	rollback bool
+	applied  chan struct{}
 }
 type startResultMessage struct {
 	entry       *entry
@@ -73,6 +76,7 @@ type startResultMessage struct {
 	err         error
 	budgetBytes int64
 	admitted    bool
+	applied     chan struct{}
 }
 type completeMessage struct {
 	handle     Handle
@@ -96,6 +100,7 @@ type turn struct {
 	pending     map[uint64]observeMessage
 	barriers    []barrierWaiter
 	lastSeq     uint64
+	nextOrder   uint64
 	metrics     Metrics
 }
 
@@ -225,6 +230,7 @@ func (t *turn) observe(call Call) {
 		}
 	}
 	entryCtx, cancel := context.WithCancel(t.ctx)
+	t.nextOrder++
 	candidate := &entry{
 		ctx:     entryCtx,
 		cancel:  cancel,
@@ -232,6 +238,7 @@ func (t *turn) observe(call Call) {
 		key:     key,
 		started: make(chan struct{}),
 		state:   entryPending,
+		order:   t.nextOrder,
 		refs:    1,
 		callIDs: map[string]struct{}{call.CallID: {}},
 	}
@@ -306,13 +313,22 @@ func (t *turn) selectClaim(key Key, callID string) *entry {
 }
 
 func (t *turn) claimOutcome(msg claimOutcomeMessage) {
+	if msg.applied != nil {
+		defer close(msg.applied)
+	}
 	candidate := msg.entry
 	if _, exists := t.entries[candidate]; !exists {
-		if msg.hit {
-			t.metrics.Hits++
-		} else {
-			t.metrics.Misses++
+		if !msg.rollback {
+			if msg.hit {
+				t.metrics.Hits++
+			} else {
+				t.metrics.Misses++
+			}
 		}
+		return
+	}
+	if msg.rollback {
+		t.rollbackClaim(candidate)
 		return
 	}
 	if msg.hit {
@@ -326,8 +342,40 @@ func (t *turn) claimOutcome(msg claimOutcomeMessage) {
 	}
 }
 
+func (t *turn) rollbackClaim(candidate *entry) {
+	if candidate.claims > candidate.successfulClaims {
+		candidate.claims--
+	}
+	for callID := range candidate.callIDs {
+		if t.byCall[callID] == nil {
+			t.byCall[callID] = candidate
+		}
+	}
+	queue := t.queues[candidate.key]
+	for _, queued := range queue {
+		if queued == candidate {
+			return
+		}
+	}
+	insertAt := len(queue)
+	for i, queued := range queue {
+		if queued.order > candidate.order {
+			insertAt = i
+			break
+		}
+	}
+	queue = append(queue, nil)
+	copy(queue[insertAt+1:], queue[insertAt:])
+	queue[insertAt] = candidate
+	t.queues[candidate.key] = queue
+}
+
 func (t *turn) startResult(msg startResultMessage) {
+	if msg.applied != nil {
+		defer close(msg.applied)
+	}
 	candidate := msg.entry
+	candidate.finishStart(msg.handle, msg.err)
 	candidate.admitted = msg.admitted
 	candidate.budgetBytes = msg.budgetBytes
 	if _, exists := t.entries[candidate]; !exists || candidate.state == entryEvicted {

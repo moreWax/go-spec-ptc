@@ -39,7 +39,10 @@ type Engine struct {
 	starts chan startJob
 	stops  chan cancelJob
 	shards [scopeShardCount]scopeShard
-	wg     sync.WaitGroup
+
+	actorWG  sync.WaitGroup
+	startWG  sync.WaitGroup
+	cancelWG sync.WaitGroup
 }
 
 // New starts a speculation engine. Close must be called to cancel active work
@@ -63,11 +66,11 @@ func New(backend Backend, cfg Config) (*Engine, error) {
 		e.shards[i].turns = make(map[Scope]*turn)
 	}
 	for range cfg.Workers {
-		e.wg.Add(1)
+		e.startWG.Add(1)
 		go e.startWorker()
 	}
 	for range cfg.CancelWorkers {
-		e.wg.Add(1)
+		e.cancelWG.Add(1)
 		go e.cancelWorker()
 	}
 	return e, nil
@@ -85,14 +88,17 @@ func (e *Engine) Begin(parent context.Context, scope Scope) error {
 	shard := e.shard(scope)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
+	if e.closed.Load() {
+		return ErrClosed
+	}
 	if _, exists := shard.turns[scope]; exists {
 		return errors.New("specptc: scope already active")
 	}
 	t := newTurn(e, parent, scope)
 	shard.turns[scope] = t
-	e.wg.Add(1)
+	e.actorWG.Add(1)
 	go func() {
-		defer e.wg.Done()
+		defer e.actorWG.Done()
 		t.run()
 	}()
 	return nil
@@ -183,39 +189,68 @@ func (e *Engine) claim(ctx context.Context, scope Scope, callID, tool string, ar
 	}
 	var selected *entry
 	select {
-	case <-ctx.Done():
+	case <-t.done:
 		return "", false
 	case selected = <-reply:
 	}
 	if selected == nil {
 		return "", false
 	}
+	if ctx.Err() != nil {
+		t.applyClaimOutcome(selected, false, true)
+		return "", false
+	}
 	select {
 	case <-ctx.Done():
-		t.send(context.Background(), claimOutcomeMessage{entry: selected, hit: false})
+		t.applyClaimOutcome(selected, false, true)
 		return "", false
 	case <-selected.started:
+		if ctx.Err() != nil {
+			t.applyClaimOutcome(selected, false, true)
+			return "", false
+		}
 		if selected.startErr != nil || selected.handle == "" {
-			if !t.send(ctx, claimOutcomeMessage{entry: selected, hit: false}) {
+			if !t.applyClaimOutcome(selected, false, false) {
 				return "", false
 			}
 			return "", false
 		}
-		if !t.send(ctx, claimOutcomeMessage{entry: selected, hit: true}) {
+		if !t.applyClaimOutcome(selected, true, false) {
 			return "", false
 		}
 		return selected.handle, true
 	}
 }
 
-// Complete releases global admission for one host execution and updates whether
-// it remains claimable. Unknown or stale handles are ignored.
-func (e *Engine) Complete(scope Scope, handle Handle, completion Completion) bool {
+func (t *turn) applyClaimOutcome(selected *entry, hit, rollback bool) bool {
+	outcome := claimOutcomeMessage{
+		entry: selected, hit: hit, rollback: rollback, applied: make(chan struct{}),
+	}
+	if !t.send(context.Background(), outcome) {
+		return false
+	}
+	select {
+	case <-outcome.applied:
+		return true
+	case <-t.done:
+		select {
+		case <-outcome.applied:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+// Complete durably enqueues one host execution's terminal state and releases
+// global admission when the turn actor applies it. Unknown or stale scopes are
+// rejected; ctx bounds mailbox backpressure.
+func (e *Engine) Complete(ctx context.Context, scope Scope, handle Handle, completion Completion) bool {
 	t := e.lookup(scope)
 	if t == nil {
 		return false
 	}
-	return t.trySend(completeMessage{handle: handle, completion: completion})
+	return t.send(ctx, completeMessage{handle: handle, completion: completion})
 }
 
 // End fences the scope, cancels unclaimed work, and returns final metrics.
@@ -237,28 +272,44 @@ func (e *Engine) End(ctx context.Context, scope Scope) (Metrics, error) {
 	}
 }
 
-// Close cancels every active turn and joins all actor and worker goroutines.
+// Close fences new work, ends every turn, drains every accepted-handle
+// cancellation, and then joins the bounded worker pools.
 func (e *Engine) Close() error {
 	if !e.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	var turns []*turn
 	for i := range e.shards {
 		shard := &e.shards[i]
 		shard.mu.Lock()
 		for scope, t := range shard.turns {
 			delete(shard.turns, scope)
-			t.trySend(endMessage{})
+			turns = append(turns, t)
 		}
 		shard.mu.Unlock()
 	}
-	e.cancel()
+	for _, t := range turns {
+		if !t.send(context.Background(), endMessage{}) {
+			t.cancel()
+		}
+	}
+	for _, t := range turns {
+		<-t.done
+	}
+	// Actors can enqueue cancellations directly, and in-flight starts can
+	// discover an accepted handle only after their turn has ended. Stop starts
+	// after actors, then drain cancellations after every producer is gone.
+	e.actorWG.Wait()
 	e.budget.close()
-	e.wg.Wait()
+	e.cancel()
+	e.startWG.Wait()
+	close(e.stops)
+	e.cancelWG.Wait()
 	return nil
 }
 
 func (e *Engine) startWorker() {
-	defer e.wg.Done()
+	defer e.startWG.Done()
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -273,32 +324,56 @@ func (e *Engine) runStart(job startJob) {
 	entry := job.entry
 	bytes := int64(len(entry.call.Arguments))
 	if err := e.budget.acquire(entry.ctx, bytes); err != nil {
-		entry.finishStart("", err)
-		job.turn.sendInternal(startResultMessage{entry: entry, err: err})
+		result := startResultMessage{entry: entry, err: err, applied: make(chan struct{})}
+		if !job.turn.sendInternal(result) {
+			entry.finishStart("", err)
+			return
+		}
+		select {
+		case <-result.applied:
+		case <-job.turn.done:
+			select {
+			case <-result.applied:
+			default:
+				entry.finishStart("", err)
+			}
+		}
 		return
 	}
 	handle, err := e.backend.Start(entry.ctx, StartRequest{Scope: job.turn.scope, Call: entry.call, Key: entry.key})
-	entry.finishStart(handle, err)
-	result := startResultMessage{entry: entry, handle: handle, err: err, budgetBytes: bytes, admitted: true}
-	if !job.turn.sendInternal(result) {
+	result := startResultMessage{
+		entry: entry, handle: handle, err: err, budgetBytes: bytes, admitted: true,
+		applied: make(chan struct{}),
+	}
+	cleanup := func() {
 		if handle != "" {
 			e.queueCancel(handle)
 		}
 		e.budget.release(bytes)
 	}
+	if !job.turn.sendInternal(result) {
+		cleanup()
+		return
+	}
+	select {
+	case <-result.applied:
+		return
+	case <-job.turn.done:
+		select {
+		case <-result.applied:
+			return
+		default:
+			cleanup()
+		}
+	}
 }
 
 func (e *Engine) cancelWorker() {
-	defer e.wg.Done()
-	for {
-		select {
-		case <-e.ctx.Done():
-			return
-		case job := <-e.stops:
-			ctx, cancel := context.WithTimeout(context.Background(), e.cfg.CancelTimeout)
-			_ = e.backend.Cancel(ctx, job.handle)
-			cancel()
-		}
+	defer e.cancelWG.Done()
+	for job := range e.stops {
+		ctx, cancel := context.WithTimeout(context.Background(), e.cfg.CancelTimeout)
+		_ = e.backend.Cancel(ctx, job.handle)
+		cancel()
 	}
 }
 
@@ -314,12 +389,8 @@ func (e *Engine) queueStart(t *turn, entry *entry) bool {
 }
 
 func (e *Engine) queueCancel(handle Handle) {
-	if handle == "" {
-		return
-	}
-	select {
-	case <-e.ctx.Done():
-	case e.stops <- cancelJob{handle: handle}:
+	if handle != "" {
+		e.stops <- cancelJob{handle: handle}
 	}
 }
 

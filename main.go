@@ -230,18 +230,21 @@ func (p *plugin) claim(ctx context.Context, params extension.SpeculationClaimPar
 	return extension.SpeculationClaimResult{Hit: hit, Handle: string(handle)}, nil
 }
 
-func (p *plugin) complete(_ context.Context, params extension.SpeculationCompleteParams) {
+func (p *plugin) complete(ctx context.Context, params extension.SpeculationCompleteParams) (extension.SpeculationCompleteResult, error) {
 	eng := p.current()
 	if eng == nil {
-		return
+		return extension.SpeculationCompleteResult{}, nil
 	}
 	completion := engine.CompletionFailed
 	if params.Completion == extension.SpeculationReady {
 		completion = engine.CompletionReady
 	}
 	handle := engine.Handle(params.Handle)
-	eng.Complete(fromWireScope(params.Scope), handle, completion)
-	p.backend.complete(params.Scope, handle)
+	accepted := eng.Complete(ctx, fromWireScope(params.Scope), handle, completion)
+	if accepted {
+		p.backend.complete(params.Scope, handle)
+	}
+	return extension.SpeculationCompleteResult{Accepted: accepted}, nil
 }
 
 func (p *plugin) end(ctx context.Context, params extension.SpeculationEndParams) (extension.SpeculationEndResult, error) {

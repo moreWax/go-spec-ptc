@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -54,6 +55,32 @@ func (b *fakeBackend) counts() (starts int, cancels []Handle) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return len(b.starts), append([]Handle(nil), b.cancels...)
+}
+
+type lateStartBackend struct {
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	cancels []Handle
+}
+
+func (b *lateStartBackend) Start(context.Context, StartRequest) (Handle, error) {
+	close(b.entered)
+	<-b.release
+	return "late-handle", nil
+}
+
+func (b *lateStartBackend) Cancel(_ context.Context, handle Handle) error {
+	b.mu.Lock()
+	b.cancels = append(b.cancels, handle)
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *lateStartBackend) cancelled(handle Handle) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.cancels) == 1 && b.cancels[0] == handle
 }
 
 func testScope(turn string) Scope {
@@ -196,6 +223,58 @@ func TestStartFailureDegradesToMiss(t *testing.T) {
 	}
 }
 
+func TestCancelledClaimRollbackPreservesFIFO(t *testing.T) {
+	backend := newFakeBackend()
+	scope := testScope("claim-cancel-rollback")
+	eng := beginTestEngine(t, backend, Config{}, scope)
+	arguments := []byte(`{"value":1}`)
+	observe(t, eng, scope, "first", string(arguments), false)
+	observe(t, eng, scope, "second", string(arguments), false)
+	waitStarts(t, backend, 2)
+
+	turn := eng.lookup(scope)
+	blockedReply := make(chan *entry)
+	if !turn.trySend(claimMessage{key: Key{Tool: "missing"}, reply: blockedReply}) {
+		t.Fatal("failed to block turn actor")
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(turn.events) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("turn actor did not enter blocking claim")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	claimed := make(chan bool, 1)
+	go func() {
+		_, ok := eng.ClaimCall(ctx, scope, Call{CallID: "second", Tool: "query", Arguments: arguments})
+		claimed <- ok
+	}()
+	<-ctx.Done()
+	select {
+	case <-claimed:
+		t.Fatal("cancelled claim returned before its queued selection could be rolled back")
+	default:
+	}
+	go func() { <-blockedReply }()
+	select {
+	case ok := <-claimed:
+		if ok {
+			t.Fatal("cancelled claim reported a hit")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled claim did not finish after actor resumed")
+	}
+	if handle := claim(t, eng, scope, string(arguments)); handle != "h-first" {
+		t.Fatalf("first claim after rollback = %q, want h-first", handle)
+	}
+	if handle := claim(t, eng, scope, string(arguments)); handle != "h-second" {
+		t.Fatalf("second claim after rollback = %q, want h-second", handle)
+	}
+	_ = endTurn(t, eng, scope)
+}
+
 func TestCompletionReleasesConcurrencyBudget(t *testing.T) {
 	backend := newFakeBackend()
 	scope := testScope("budget")
@@ -217,11 +296,11 @@ func TestCompletionReleasesConcurrencyBudget(t *testing.T) {
 		t.Fatalf("unexpected third start before completion: %s", req.Call.CallID)
 	case <-time.After(50 * time.Millisecond):
 	}
-	if !eng.Complete(scope, Handle("h-"+started[0].Call.CallID), CompletionReady) {
+	if !eng.Complete(context.Background(), scope, Handle("h-"+started[0].Call.CallID), CompletionReady) {
 		t.Fatal("completion rejected")
 	}
 	waitStarts(t, backend, 1)
-	if !eng.Complete(scope, Handle("h-"+started[1].Call.CallID), CompletionReady) {
+	if !eng.Complete(context.Background(), scope, Handle("h-"+started[1].Call.CallID), CompletionReady) {
 		t.Fatal("completion rejected")
 	}
 	waitStarts(t, backend, 1)
@@ -236,8 +315,8 @@ func TestEndCancelsEveryUnclaimedExecution(t *testing.T) {
 	observe(t, eng, scope, "b", `{"n":2}`, false)
 	waitStarts(t, backend, 2)
 	metrics := endTurn(t, eng, scope)
-	if metrics.Cancelled != 2 || metrics.Evictions != 2 {
-		t.Fatalf("metrics = %+v", metrics)
+	if metrics.Evictions != 2 {
+		t.Fatalf("metrics = %+v, want two evictions", metrics)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -249,6 +328,82 @@ func TestEndCancelsEveryUnclaimedExecution(t *testing.T) {
 			t.Fatalf("cancels = %v, want 2", cancels)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestCloseCancelsEveryUnclaimedAcceptedHandle(t *testing.T) {
+	backend := newFakeBackend()
+	eng, err := New(backend, Config{Workers: 4, CancelWorkers: 2, MaxInflight: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := testScope("close-cancel")
+	if err := eng.Begin(context.Background(), scope); err != nil {
+		t.Fatal(err)
+	}
+	const count = 12
+	for i := range count {
+		observe(t, eng, scope, fmt.Sprintf("close-%d", i), fmt.Sprintf(`{"n":%d}`, i), false)
+	}
+	waitStarts(t, backend, count)
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+	starts, cancels := backend.counts()
+	if starts != count || len(cancels) != count {
+		t.Fatalf("after Close: starts=%d cancels=%v, want %d each", starts, cancels, count)
+	}
+	seen := make(map[Handle]bool, count)
+	for _, handle := range cancels {
+		if seen[handle] {
+			t.Fatalf("duplicate cancellation for %q", handle)
+		}
+		seen[handle] = true
+	}
+	for i := range count {
+		if handle := Handle(fmt.Sprintf("h-close-%d", i)); !seen[handle] {
+			t.Fatalf("missing cancellation for %q", handle)
+		}
+	}
+	if err := eng.Begin(context.Background(), testScope("after-close")); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Begin after Close = %v, want ErrClosed", err)
+	}
+}
+
+func TestCloseCancelsHandleAcceptedAfterActorTeardown(t *testing.T) {
+	backend := &lateStartBackend{entered: make(chan struct{}), release: make(chan struct{})}
+	eng, err := New(backend, Config{Workers: 1, CancelWorkers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := testScope("late-start-close")
+	if err := eng.Begin(context.Background(), scope); err != nil {
+		t.Fatal(err)
+	}
+	observe(t, eng, scope, "late", `{}`, false)
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("backend start did not begin")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- eng.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before in-flight Start: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(backend.release)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not join in-flight Start")
+	}
+	if !backend.cancelled("late-handle") {
+		t.Fatal("handle accepted after actor teardown was not cancelled")
 	}
 }
 
@@ -268,8 +423,8 @@ func TestClaimCallPreservesIdentityUnderParallelClaimOrder(t *testing.T) {
 	if !ok || first != "h-first" {
 		t.Fatalf("first claim = %q, %v", first, ok)
 	}
-	eng.Complete(scope, second, CompletionReady)
-	eng.Complete(scope, first, CompletionReady)
+	eng.Complete(context.Background(), scope, second, CompletionReady)
+	eng.Complete(context.Background(), scope, first, CompletionReady)
 	_ = endTurn(t, eng, scope)
 }
 
@@ -321,6 +476,41 @@ func TestObservationBarrierOrdersConcurrentFrames(t *testing.T) {
 	_ = endTurn(t, eng, scope)
 }
 
+func TestCompleteWaitsForTurnMailboxCapacity(t *testing.T) {
+	backend := newFakeBackend()
+	scope := testScope("completion-backpressure")
+	eng := beginTestEngine(t, backend, Config{TurnQueueDepth: 4}, scope)
+	turn := eng.lookup(scope)
+	blockedReply := make(chan *entry)
+	if !turn.trySend(claimMessage{reply: blockedReply}) {
+		t.Fatal("failed to enqueue blocking actor message")
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(turn.events) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("turn actor did not enter blocking message")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for i := range cap(turn.events) {
+		if !turn.trySend(observeMessage{call: Call{CallID: fmt.Sprintf("queued-%d", i), Tool: "query", Arguments: []byte(`{}`)}}) {
+			t.Fatalf("failed to fill turn mailbox at %d", i)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if eng.Complete(ctx, scope, "completion", CompletionReady) {
+		t.Fatal("completion unexpectedly bypassed full turn mailbox")
+	}
+	go func() { <-blockedReply }()
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), time.Second)
+	defer retryCancel()
+	if !eng.Complete(retryCtx, scope, "completion", CompletionReady) {
+		t.Fatal("completion was not durably enqueued after mailbox capacity returned")
+	}
+	_ = endTurn(t, eng, scope)
+}
+
 func TestStaleScopeCannotObserveClaimOrComplete(t *testing.T) {
 	backend := newFakeBackend()
 	scope := testScope("stale")
@@ -332,7 +522,7 @@ func TestStaleScopeCannotObserveClaimOrComplete(t *testing.T) {
 	if _, ok := eng.Claim(context.Background(), scope, "query", []byte(`{}`)); ok {
 		t.Fatal("stale Claim succeeded")
 	}
-	if eng.Complete(scope, "late", CompletionReady) {
+	if eng.Complete(context.Background(), scope, "late", CompletionReady) {
 		t.Fatal("stale Complete succeeded")
 	}
 }

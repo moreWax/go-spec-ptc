@@ -51,7 +51,7 @@ func BenchmarkConcurrentObserveClaim(b *testing.B) {
 				b.Errorf("claim %s missed", callID)
 				continue
 			}
-			eng.Complete(scope, handle, CompletionReady)
+			eng.Complete(context.Background(), scope, handle, CompletionReady)
 		}
 	})
 	b.StopTimer()

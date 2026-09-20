@@ -12,7 +12,7 @@ The scheduling semantics are ported from
 
 ## Build and install
 
-A Reasonix build with Extension Protocol v2 speculation support is required. Until those SDK APIs are published, clone `go-spec-ptc` beside `DeepSeek-Reasonix`; the temporary `go.mod` replacement uses that sibling checkout.
+A Reasonix build with Extension Protocol v2 speculation support is required. The current SDK dependency is pinned to the matching [`moreWax/DeepSeek-Reasonix` host branch](https://github.com/moreWax/DeepSeek-Reasonix/tree/feat/sptc-host) until the protocol is available upstream.
 
 ```bash
 cd go-spec-ptc

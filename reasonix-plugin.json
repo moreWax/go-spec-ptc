@@ -1,0 +1,21 @@
+{
+  "apiVersion": "reasonix.io/plugin/v2",
+  "name": "spec-ptc",
+  "version": "0.1.0",
+  "description": "High-concurrency speculative tool execution for streamed Reasonix calls",
+  "repository": "https://github.com/moreWax/go-spec-ptc",
+  "provides": [
+    {
+      "namespace": "plugin/spec-ptc",
+      "kind": "strategies",
+      "id": "speculation",
+      "version": "0.1.0"
+    }
+  ],
+  "runtime": {
+    "command": "${REASONIX_PLUGIN_ROOT}/bin/reasonix-spec-ptc",
+    "required": false,
+    "replaces": ["speculation"],
+    "capabilities": ["strategies"]
+  }
+}

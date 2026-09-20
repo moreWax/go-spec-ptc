@@ -1,0 +1,8 @@
+bin/
+*.test
+*.out
+*.coverprofile
+coverage.out
+cpu.prof
+mem.prof
+.DS_Store

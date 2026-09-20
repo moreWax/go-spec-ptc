@@ -25,6 +25,13 @@ The manifest launches `bin/reasonix-spec-ptc`. Re-run `make build` after source
 changes. `--link` is intended for development; omit it to copy a prebuilt plugin
 package.
 
+## Runtime toggle
+
+From the matching sPTC-enabled Reasonix TUI, use `/sptc status`, `/sptc on`, or
+`/sptc off`. The command updates the installed plugin state and refreshes the
+active session after current work finishes. A stock Reasonix process still
+cannot gain the host protocol at runtime; start with the matching host build.
+
 ## Configuration
 
 The extension speculates `read_file` by default. The built-in explicitly opts
